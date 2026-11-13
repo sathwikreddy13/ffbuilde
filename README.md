@@ -9,4 +9,4 @@ Mobile-first India-only EV road-trip planner for four-wheelers.
 3. Enable billing, **Routes API**, and **Places API (New)** in Google Cloud.
 4. Deploy. The page calls only `/api/plan`; provider keys are never sent to the browser.
 
-Google provides driving route data and station discovery. Open Charge Map enriches nearby matches with connector, power, access and listed operational status. The app never claims a port is currently free.
+Google provides driving route data and station discovery. Open Charge Map is also searched directly along the route, then used to enrich close Google matches with connector, power, access and listed operational status. The app shows every candidate found on each leg, prioritizes reachable recommended stops, and never claims a port is currently free.
