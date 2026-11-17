@@ -1,7 +1,203 @@
-const ROUTES='https://routes.googleapis.com/directions/v2:computeRoutes',PLACES='https://places.googleapis.com/v1/places:searchNearby',OCM='https://api.openchargemap.io/v3/poi/';
-const cache=new Map(),ttl={places:900000,ocm:86400000};const out=(res,status,body)=>{res.status(status).setHeader('Content-Type','application/json');res.end(JSON.stringify(body))};const n=x=>Number(String(x||0).replace(/[^0-9.]/g,''));const key=x=>`${x.latitude.toFixed(3)},${x.longitude.toFixed(3)}`;const hav=(a,b)=>{const d=Math.PI/180,x=(b.latitude-a.latitude)*d,y=(b.longitude-a.longitude)*d,q=Math.sin(x/2)**2+Math.cos(a.latitude*d)*Math.cos(b.latitude*d)*Math.sin(y/2)**2;return 12742*Math.asin(Math.sqrt(q))};const fromPlace=x=>x?.placeId?{placeId:x.placeId}:{address:x?.label||x};const label=x=>typeof x==='string'?x:x.label;
-async function remembered(type,id,work){const hit=cache.get(`${type}:${id}`);if(hit&&Date.now()-hit.at<ttl[type])return hit.value;const value=await work();cache.set(`${type}:${id}`,{at:Date.now(),value});return value}async function google(url,body,fields){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-Goog-Api-Key':process.env.GOOGLE_MAPS_API_KEY,'X-Goog-FieldMask':fields},body:JSON.stringify(body)});if(!r.ok){const detail=await r.text();console.error(JSON.stringify({service:url.includes('routes.googleapis.com')?'Routes API':'Places API',status:r.status,detail:detail.slice(0,500)}));const message=r.status===429?'Station-search quota has been reached. Try again later.':r.status===403?'Google Maps denied this request. Enable both APIs and remove browser/IP restrictions from this server-side key.':r.status===400?'Google Maps rejected the trip details. Choose a suggested location and try again.':'Google Maps could not retrieve route or charger data.';const error=Error(message);error.status=r.status;throw error}return r.json()}
-function decode(encoded){let i=0,lat=0,lng=0,pts=[];while(i<encoded.length){let shift=0,result=0,b;do{b=encoded.charCodeAt(i++)-63;result|=(b&31)<<shift;shift+=5}while(b>=32);lat+=(result&1)?~(result>>1):(result>>1);shift=0;result=0;do{b=encoded.charCodeAt(i++)-63;result|=(b&31)<<shift;shift+=5}while(b>=32);lng+=(result&1)?~(result>>1):(result>>1);pts.push({latitude:lat/1e5,longitude:lng/1e5})}return pts}function samples(leg){const pts=decode(leg.polyline?.encodedPolyline||'');if(pts.length<2)return[leg.startLocation.latLng,leg.endLocation.latLng];const count=Math.min(4,Math.max(1,Math.ceil(n(leg.distanceMeters)/130000))),step=Math.max(1,Math.floor((pts.length-1)/count));return[pts[0],...Array.from({length:count},(_,i)=>pts[Math.min(pts.length-1,Math.floor(step/2)+i*step)]),pts.at(-1)]}function along(location,leg){const pts=decode(leg.polyline?.encodedPolyline||'');if(pts.length<2)return{routeKm:0,offRouteKm:0};let done=0,best={offRouteKm:Infinity,routeKm:0};for(let i=1;i<pts.length;i++){const seg=hav(pts[i-1],pts[i]),dist=hav(location,pts[i]);if(dist<best.offRouteKm)best={offRouteKm:dist,routeKm:done+seg/2};done+=seg}return best}
-async function places(center){return remembered('places',key(center),async()=>{const d=await google(PLACES,{includedTypes:['electric_vehicle_charging_station'],maxResultCount:6,rankPreference:'DISTANCE',locationRestriction:{circle:{center,radius:9000}}},'places.id,places.displayName,places.formattedAddress,places.location,places.evChargeOptions');return(d.places||[]).map(p=>({id:p.id,name:p.displayName?.text||'EV charging station',address:p.formattedAddress||'',location:p.location,connectors:(p.evChargeOptions?.connectorAggregation||[]).map(c=>({type:c.type,powerKw:c.maxChargeRateKw||null})),source:'Google Places'}))})}function ocmStation(p){return{id:`ocm-${p.ID}`,name:p.AddressInfo?.Title||'EV charging station',address:[p.AddressInfo?.AddressLine1,p.AddressInfo?.Town,p.AddressInfo?.StateOrProvince].filter(Boolean).join(', '),location:{latitude:p.AddressInfo?.Latitude,longitude:p.AddressInfo?.Longitude},connectors:(p.Connections||[]).map(c=>({type:c.ConnectionType?.Title||'Connector',powerKw:c.PowerKW||null})),source:'Open Charge Map',validation:'Open Charge Map',ocmStatus:p.StatusType?.Title||null,access:p.UsageType?.Title||null,lastVerified:p.DateLastVerified||null}}async function ocmPlaces(center){if(!process.env.OPENCHARGEMAP_API_KEY)return[];return remembered('ocm',`near-${key(center)}`,async()=>{try{const u=new URL(OCM);u.search=new URLSearchParams({output:'json',latitude:center.latitude,longitude:center.longitude,distance:'9',distanceunit:'KM',maxresults:'12',key:process.env.OPENCHARGEMAP_API_KEY});const r=await fetch(u);return r.ok?(await r.json()).map(ocmStation).filter(s=>Number.isFinite(s.location.latitude)&&Number.isFinite(s.location.longitude)):[]}catch{return[]}})}async function enrich(s){if(!process.env.OPENCHARGEMAP_API_KEY||!s.location)return s;return remembered('ocm',s.id,async()=>{try{const nearby=await ocmPlaces(s.location),m=nearby.sort((a,b)=>hav(s.location,a.location)-hav(s.location,b.location))[0];if(!m||hav(s.location,m.location)>.4)return s;return{...s,validation:'Verified against Open Charge Map',ocmStatus:m.ocmStatus,access:m.access,lastVerified:m.lastVerified,connectors:s.connectors.length?s.connectors:m.connectors}}catch{return s}})}function mergeStations(stations){const out=[];for(const station of stations){const existing=out.find(x=>hav(x.location,station.location)<.3);if(existing){if(!existing.connectors.length&&station.connectors.length)existing.connectors=station.connectors;if(station.source==='Open Charge Map')Object.assign(existing,{validation:'Verified against Open Charge Map',ocmStatus:station.ocmStatus,access:station.access,lastVerified:station.lastVerified});}else out.push(station)}return out}
-function choose(legs,rangeKm){const reserve=rangeKm*.15,plan=[];let battery=rangeKm;for(const leg of legs){const length=leg.distanceMeters/1000;let at=0,options=[...leg.stations].sort((a,b)=>a.routeKm-b.routeKm),selected=[],warning=null;while(length-at>battery-reserve){const reachable=options.filter(s=>s.routeKm>=at-.5&&s.routeKm<=at+battery-reserve);if(!reachable.length){warning=`No listed charger could be reached while preserving the ${Math.round(reserve)} km buffer.`;break}const stop=reachable[reachable.length-1],drive=Math.max(0,stop.routeKm-at);battery=Math.max(0,battery-drive);selected.push({...stop,arrivalRangeKm:Math.round(battery)});battery=rangeKm;at=Math.max(at,stop.routeKm+.5);options=options.filter(s=>s.id!==stop.id);if(selected.length>5){warning='More than five stops would be required on this leg.';break}}battery=Math.max(0,battery-(length-at));plan.push({...leg,selectedStops:selected,needsCharge:selected.length>0||!!warning,arrivalRangeKm:Math.round(battery),warning})}return plan}
-export default async function handler(req,res){if(req.method!=='POST')return out(res,405,{error:'Method not allowed.'});if(!process.env.GOOGLE_MAPS_API_KEY)return out(res,500,{error:'Google Maps is not configured yet.'});const{start,stops,range,model}=req.body||{};if(!start||!Array.isArray(stops)||!stops.length||!Number(range))return out(res,400,{error:'Enter a start, at least one stop, and usable range.'});try{const route=[start,...stops,start],d=await google(ROUTES,{origin:fromPlace(start),destination:fromPlace(start),intermediates:stops.map(fromPlace),travelMode:'DRIVE',routingPreference:'TRAFFIC_AWARE'},'routes.distanceMeters,routes.legs.distanceMeters,routes.legs.duration,routes.legs.startLocation,routes.legs.endLocation,routes.legs.polyline.encodedPolyline'),r=d.routes?.[0];if(!r?.legs?.length)throw Error('No driveable route was found.');const raw=await Promise.all(r.legs.map(async(leg,i)=>{const points=samples(leg),list=(await Promise.all(points.map(async point=>{const [g,o]=await Promise.all([places(point),ocmPlaces(point)]);return[...g,...o]}))).flat(),stations=mergeStations(list).map(s=>({...s,...along(s.location,leg)})).filter(s=>s.offRouteKm<=12).sort((a,b)=>a.routeKm-b.routeKm).slice(0,24),enriched=await Promise.all(stations.map(enrich));return{from:label(route[i]),to:label(route[i+1]),distanceMeters:n(leg.distanceMeters),durationSeconds:n(leg.duration),stations:enriched}}));out(res,200,{route:route.map(label),model,totalMeters:n(r.distanceMeters),rangeKm:+range,bufferKm:Math.round(+range*.15),legs:choose(raw,+range)})}catch(error){out(res,502,{error:error.message||'Unable to build this route.'})}}
+const ROUTES_URL = 'https://routes.googleapis.com/directions/v2:computeRoutes';
+const PLACES_URL = 'https://places.googleapis.com/v1/places:searchNearby';
+const OCM_URL = 'https://api.openchargemap.io/v3/poi/';
+const CACHE_LIMIT = 240;
+const cache = new Map();
+let placesBlockedUntil = 0;
+
+const respond = (res, status, body) => {
+  res.status(status).setHeader('Content-Type', 'application/json');
+  res.end(JSON.stringify(body));
+};
+const metres = value => Number(String(value || 0).replace(/[^0-9.]/g, ''));
+const asLocation = value => value?.placeId ? { placeId: value.placeId } : { address: value?.label || value };
+const label = value => typeof value === 'string' ? value : value.label;
+const validPoint = point => Number.isFinite(point?.latitude) && Number.isFinite(point?.longitude);
+const cacheKey = point => `${point.latitude.toFixed(3)},${point.longitude.toFixed(3)}`;
+
+function distanceKm(a, b) {
+  const toRad = Math.PI / 180;
+  const dLat = (b.latitude - a.latitude) * toRad;
+  const dLng = (b.longitude - a.longitude) * toRad;
+  const q = Math.sin(dLat / 2) ** 2 + Math.cos(a.latitude * toRad) * Math.cos(b.latitude * toRad) * Math.sin(dLng / 2) ** 2;
+  return 12742 * Math.asin(Math.sqrt(q));
+}
+
+function cached(name, ttl, work) {
+  const hit = cache.get(name);
+  if (hit && Date.now() - hit.at < ttl) return hit.value;
+  return Promise.resolve(work()).then(value => {
+    cache.set(name, { at: Date.now(), value });
+    while (cache.size > CACHE_LIMIT) cache.delete(cache.keys().next().value);
+    return value;
+  });
+}
+
+async function fetchWithTimeout(url, options, timeoutMs = 9000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try { return await fetch(url, { ...options, signal: controller.signal }); }
+  finally { clearTimeout(timer); }
+}
+
+async function google(url, body, fieldMask) {
+  const response = await fetchWithTimeout(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': process.env.GOOGLE_MAPS_API_KEY, 'X-Goog-FieldMask': fieldMask },
+    body: JSON.stringify(body)
+  });
+  if (!response.ok) {
+    const detail = await response.text();
+    console.error(JSON.stringify({ service: url.includes('routes.googleapis.com') ? 'Routes API' : 'Places API', status: response.status, detail: detail.slice(0, 350) }));
+    const error = Error(response.status === 429 ? 'Station-search quota has been reached. Showing any Open Charge Map results instead.' : response.status === 403 ? 'Google Maps denied this request. Check the server key restrictions and enabled APIs.' : 'Google Maps could not retrieve route or charger data.');
+    error.status = response.status;
+    throw error;
+  }
+  return response.json();
+}
+
+function decodePolyline(encoded = '') {
+  let index = 0, latitude = 0, longitude = 0;
+  const points = [];
+  while (index < encoded.length) {
+    let shift = 0, result = 0, byte;
+    do { byte = encoded.charCodeAt(index++) - 63; result |= (byte & 31) << shift; shift += 5; } while (byte >= 32);
+    latitude += result & 1 ? ~(result >> 1) : result >> 1;
+    shift = 0; result = 0;
+    do { byte = encoded.charCodeAt(index++) - 63; result |= (byte & 31) << shift; shift += 5; } while (byte >= 32);
+    longitude += result & 1 ? ~(result >> 1) : result >> 1;
+    points.push({ latitude: latitude / 1e5, longitude: longitude / 1e5 });
+  }
+  return points;
+}
+
+function routeSamples(leg) {
+  const points = decodePolyline(leg.polyline?.encodedPolyline);
+  if (points.length < 2) return [leg.startLocation.latLng, leg.endLocation.latLng];
+  const lengths = [0];
+  for (let index = 1; index < points.length; index++) lengths[index] = lengths[index - 1] + distanceKm(points[index - 1], points[index]);
+  const count = Math.min(4, Math.max(2, Math.ceil(metres(leg.distanceMeters) / 250000) + 1));
+  return Array.from({ length: count }, (_, index) => {
+    const target = lengths.at(-1) * index / (count - 1);
+    const nearest = lengths.findIndex(length => length >= target);
+    return points[Math.max(0, nearest)];
+  });
+}
+
+function routePosition(location, leg) {
+  const points = decodePolyline(leg.polyline?.encodedPolyline);
+  if (points.length < 2) return { routeKm: 0, offRouteKm: 0 };
+  const latitudeScale = 111.32;
+  const longitudeScale = 111.32 * Math.cos(location.latitude * Math.PI / 180);
+  let travelled = 0, best = { offRouteKm: Infinity, routeKm: 0 };
+  for (let index = 1; index < points.length; index++) {
+    const start = points[index - 1], end = points[index];
+    const x = (end.longitude - start.longitude) * longitudeScale, y = (end.latitude - start.latitude) * latitudeScale;
+    const px = (location.longitude - start.longitude) * longitudeScale, py = (location.latitude - start.latitude) * latitudeScale;
+    const segmentSquared = x * x + y * y;
+    const factor = segmentSquared ? Math.max(0, Math.min(1, (px * x + py * y) / segmentSquared)) : 0;
+    const projected = { latitude: start.latitude + (end.latitude - start.latitude) * factor, longitude: start.longitude + (end.longitude - start.longitude) * factor };
+    const segment = distanceKm(start, end), offRouteKm = distanceKm(location, projected);
+    if (offRouteKm < best.offRouteKm) best = { offRouteKm, routeKm: travelled + segment * factor };
+    travelled += segment;
+  }
+  return best;
+}
+
+async function googleStations(point) {
+  if (Date.now() < placesBlockedUntil) return [];
+  return cached(`google:${cacheKey(point)}`, 15 * 60_000, async () => {
+    try {
+      const data = await google(PLACES_URL, { includedTypes: ['electric_vehicle_charging_station'], maxResultCount: 6, rankPreference: 'DISTANCE', locationRestriction: { circle: { center: point, radius: 8000 } } }, 'places.id,places.displayName,places.formattedAddress,places.location,places.evChargeOptions');
+      return (data.places || []).map(place => ({
+        id: `google-${place.id}`, name: place.displayName?.text || 'EV charging station', address: place.formattedAddress || '', location: place.location,
+        connectors: (place.evChargeOptions?.connectorAggregation || []).map(connector => ({ type: connector.type, powerKw: connector.maxChargeRateKw || null })), source: 'Google Places'
+      }));
+    } catch (error) {
+      if (error.status === 429) placesBlockedUntil = Date.now() + 10 * 60_000;
+      return [];
+    }
+  });
+}
+
+function openChargeStation(place) {
+  const location = { latitude: place.AddressInfo?.Latitude, longitude: place.AddressInfo?.Longitude };
+  return {
+    id: `ocm-${place.ID}`, name: place.AddressInfo?.Title || 'EV charging station', location,
+    address: [place.AddressInfo?.AddressLine1, place.AddressInfo?.Town, place.AddressInfo?.StateOrProvince].filter(Boolean).join(', '),
+    connectors: (place.Connections || []).map(connector => ({ type: connector.ConnectionType?.Title || 'Connector', powerKw: connector.PowerKW || null })),
+    source: 'Open Charge Map', validation: 'Open Charge Map', ocmStatus: place.StatusType?.Title || null, access: place.UsageType?.Title || null, lastVerified: place.DateLastVerified || null
+  };
+}
+
+async function openChargeStations(point) {
+  if (!process.env.OPENCHARGEMAP_API_KEY) return [];
+  return cached(`ocm:${cacheKey(point)}`, 24 * 60 * 60_000, async () => {
+    try {
+      const url = new URL(OCM_URL);
+      url.search = new URLSearchParams({ output: 'json', latitude: point.latitude, longitude: point.longitude, distance: '8', distanceunit: 'KM', maxresults: '12', key: process.env.OPENCHARGEMAP_API_KEY });
+      const response = await fetchWithTimeout(url, {}, 9000);
+      return response.ok ? (await response.json()).map(openChargeStation).filter(station => validPoint(station.location)) : [];
+    } catch { return []; }
+  });
+}
+
+function mergeStations(stations) {
+  const merged = [];
+  for (const station of stations.filter(station => validPoint(station.location))) {
+    const existing = merged.find(candidate => distanceKm(candidate.location, station.location) < 0.3);
+    if (!existing) { merged.push(station); continue; }
+    if (!existing.connectors.length && station.connectors.length) existing.connectors = station.connectors;
+    if (station.source === 'Open Charge Map') Object.assign(existing, { validation: 'Verified against Open Charge Map', ocmStatus: station.ocmStatus, access: station.access, lastVerified: station.lastVerified });
+  }
+  return merged;
+}
+
+function selectStops(legs, rangeKm) {
+  const bufferKm = rangeKm * 0.15, plan = [];
+  let batteryKm = rangeKm;
+  for (const leg of legs) {
+    const lengthKm = leg.distanceMeters / 1000;
+    let positionKm = 0, candidates = [...leg.stations].sort((a, b) => a.routeKm - b.routeKm), selectedStops = [], warning = null;
+    while (lengthKm - positionKm > batteryKm - bufferKm) {
+      const reachable = candidates.filter(station => station.routeKm >= positionKm - 0.5 && station.routeKm <= positionKm + batteryKm - bufferKm);
+      if (!reachable.length) { warning = `No listed charger could be reached while preserving the ${Math.round(bufferKm)} km buffer.`; break; }
+      const station = reachable.at(-1), travelledKm = Math.max(0, station.routeKm - positionKm);
+      batteryKm = Math.max(0, batteryKm - travelledKm);
+      selectedStops.push({ ...station, arrivalRangeKm: Math.round(batteryKm) });
+      batteryKm = rangeKm;
+      positionKm = Math.max(positionKm, station.routeKm + 0.5);
+      candidates = candidates.filter(candidate => candidate.id !== station.id);
+      if (selectedStops.length > 5) { warning = 'More than five charge stops would be required on this leg.'; break; }
+    }
+    batteryKm = Math.max(0, batteryKm - (lengthKm - positionKm));
+    plan.push({ ...leg, selectedStops, needsCharge: selectedStops.length > 0 || Boolean(warning), arrivalRangeKm: Math.round(batteryKm), warning });
+  }
+  return plan;
+}
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') return respond(res, 405, { error: 'Method not allowed.' });
+  if (!process.env.GOOGLE_MAPS_API_KEY) return respond(res, 500, { error: 'Google Maps is not configured yet.' });
+  const { start, stops, range, model } = req.body || {};
+  const usableRange = Number(range);
+  if (!start?.label || !Array.isArray(stops) || !stops.length || stops.length > 8 || !Number.isFinite(usableRange) || usableRange < 100 || usableRange > 1_000) return respond(res, 400, { error: 'Enter a start, one to eight stops, and a usable range between 100 and 1,000 km.' });
+  if (String(model || '').length > 100 || [start, ...stops].some(place => !place?.label || String(place.label).length > 180)) return respond(res, 400, { error: 'One of the trip details is invalid.' });
+  try {
+    const route = [start, ...stops, start];
+    const result = await google(ROUTES_URL, { origin: asLocation(start), destination: asLocation(start), intermediates: stops.map(asLocation), travelMode: 'DRIVE', routingPreference: 'TRAFFIC_AWARE' }, 'routes.distanceMeters,routes.legs.distanceMeters,routes.legs.duration,routes.legs.startLocation,routes.legs.endLocation,routes.legs.polyline.encodedPolyline');
+    const routeData = result.routes?.[0];
+    if (!routeData?.legs?.length) throw Error('No driveable route was found.');
+    const providerWarnings = [];
+    const rawLegs = await Promise.all(routeData.legs.map(async (routeLeg, index) => {
+      const sampleResults = await Promise.all(routeSamples(routeLeg).map(async point => {
+        const [google, ocm] = await Promise.all([googleStations(point), openChargeStations(point)]);
+        return [...google, ...ocm];
+      }));
+      const stations = mergeStations(sampleResults.flat()).map(station => ({ ...station, ...routePosition(station.location, routeLeg) })).filter(station => station.offRouteKm <= 10).sort((a, b) => a.routeKm - b.routeKm).slice(0, 30);
+      if (!stations.length) providerWarnings.push(`No station records were returned near ${label(route[index])} → ${label(route[index + 1])}.`);
+      return { from: label(route[index]), to: label(route[index + 1]), distanceMeters: metres(routeLeg.distanceMeters), durationSeconds: metres(routeLeg.duration), stations };
+    }));
+    return respond(res, 200, { route: route.map(label), model, totalMeters: metres(routeData.distanceMeters), rangeKm: usableRange, bufferKm: Math.round(usableRange * 0.15), providerWarnings, legs: selectStops(rawLegs, usableRange) });
+  } catch (error) { return respond(res, error.status === 403 ? 403 : 502, { error: error.message || 'Unable to build this route.' }); }
+}
